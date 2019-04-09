@@ -1,11 +1,12 @@
 #! /usr/bin/env node
 const fs = require('fs')
 const os = require('os')
+const tmp = require('tmp')
 const path = require('path')
 const program = require('commander')
 const request = require('request')
 const readlineSync = require('readline-sync')
-const { execSync, execFileSync } = require('child_process')
+const { spawn, execFileSync } = require('child_process')
 
 const USER_FILE = '.pituser.txt'
 const CONNECT_FILE = '.pitconnect.txt'
@@ -13,6 +14,8 @@ const REQUEST_FILE = '.pitrequest.txt'
 
 const githubGitPrefix = 'git@github.com:'
 const githubHttpsPrefix = 'https://github.com/'
+
+var globalunmount
 
 function fail(message) {
     console.error('Command failed: ' + message)
@@ -35,8 +38,11 @@ function promptUserInfo(user) {
 
 function promptNodeInfo(node) {
     node = node || {}
-    if (!node.address) {
-        node.address = readlineSync.question('Node\'s domain name or IP address: ')
+    if (!node.endpoint) {
+        node.endpoint = readlineSync.question('LXD endpoint: ')
+    }
+    if (!node.password) {
+        node.password = readlineSync.question('LXD endpoint password: ', { hideEchoBack: true })
     }
     return node
 }
@@ -49,9 +55,17 @@ function promptAliasInfo(alias) {
     return alias
 }
 
-function callPit(verb, resource, content, callback, asStream) {
+function promptGroupInfo(group) {
+    group = group || {}
+    if (!group.title) {
+        group.title = readlineSync.question('Group title: ')
+    }
+    return group
+}
+
+function callPit(verb, resource, content, callback, callOptions) {
     if (content instanceof Function) {
-        asStream = callback
+        callOptions = callback
         callback = content
         content = undefined
     }
@@ -84,20 +98,23 @@ function callPit(verb, resource, content, callback, asStream) {
     var username
     var token = ''
 
-    function sendRequest(verb, resource, content, callback, asStream) {
+    function sendRequest(verb, resource, content, callback, callOptions) {
         if (content instanceof Function) {
-            asStream = callback
+            callOptions = callback
             callback = content
             content = undefined
         }
-        let resourceUrl = pitUrl + '/' + resource
+        let headers = {
+            'X-Auth-Token': token,
+            'Content-Type': 'application/json'
+        }
+        if (callOptions && callOptions.offset) {
+            headers['Range'] = 'bytes=' + callOptions.offset + '-'
+        }
         let creq = request[verb]({
-            url: resourceUrl,
+            url: pitUrl + '/' + resource,
             agentOptions: agentOptions,
-            headers: {
-                'X-Auth-Token': token,
-                'content-type': 'application/json'
-            },
+            headers: headers,
             body: content ? JSON.stringify(content) : undefined
         })
         .on('error', err => fail('Unable to reach pit: ' + err.code))
@@ -107,12 +124,12 @@ function callPit(verb, resource, content, callback, asStream) {
                 authenticate(
                     username,
                     password,
-                    () => sendRequest(verb, resource, content, callback, asStream)
+                    () => sendRequest(verb, resource, content, callback, callOptions)
                 )
-            } else if (asStream) {
+            } else if (callOptions && callOptions.asStream) {
                 callback(res.statusCode, creq)
             } else {
-                chunks = []
+                let chunks = []
                 creq.on('data', chunk => chunks.push(chunk))
                 creq.on('end', () => {
                     let body = Buffer.concat(chunks)
@@ -134,7 +151,7 @@ function callPit(verb, resource, content, callback, asStream) {
         sendRequest('post', 'users/' + username + '/authenticate', { password: password }, function(code, body) {
             if (code == 200) {
                 token = body.token
-                fs.writeFile(userFile, username + '\n' + token, function(err) {
+                fs.writeFile(userFile, username + '\n' + token, { mode: parseInt('600', 8) }, function(err) {
                     if(err) {
                         console.error('Unable to store user info: ' + err)
                         process.exit(1)
@@ -162,7 +179,15 @@ function callPit(verb, resource, content, callback, asStream) {
     }
 
     function sendCommand() {
-        sendRequest(verb, resource, content, callback, asStream)
+        if (verb == 'connection') {
+            callback({
+                url: pitUrl,
+                token: token,
+                ca: agentOptions && agentOptions.ca
+            })
+        } else {
+            sendRequest(verb, resource, content, callback, callOptions)
+        }
     }
 
     if(!fs.existsSync(userFile)) {
@@ -187,17 +212,17 @@ function callPit(verb, resource, content, callback, asStream) {
                         { trueValue: ['yes', 'y'], falseValue: ['no', 'n'] }
                     )
                     if (register) {
-                        user = promptUserInfo()
+                        let user = promptUserInfo()
                         sendRequest('put', userPath, user, function(code, body) {
                             if (code == 200) {
                                 authenticate(username, user.password, sendCommand)
                             } else {
                                 console.error('Unable to register user.')
-                                exit(1)
+                                process.exit(1)
                             }
                         })
                     } else {
-                        exit(0)
+                        process.exit(0)
                     }
                 }
             })
@@ -209,6 +234,10 @@ function callPit(verb, resource, content, callback, asStream) {
         loadUser()
         sendCommand()
     }
+}
+
+function getConnectionSettings(callback) {
+    callPit('connection', null, null, callback)
 }
 
 const jobStates = {
@@ -242,8 +271,9 @@ const nodeStateNames = [
 
 const indent = '  '
 const entityUser = 'user:<username>'
+const entityGroup = 'group:<group name>'
 const entityNode = 'node:<node name>'
-const entityJob = 'node:<job number>'
+const entityJob = 'job:<job number>'
 const entityAlias = 'alias:<alias>'
 
 const entityDescriptors = {
@@ -258,10 +288,8 @@ const entityDescriptors = {
     'node': {
         'id': 'Node name',
         'address': 'Address',
-        'state': (o, v) => ['State', nodeStateNames[v]],
+        'online': (o, v) => ['State', v ? 'ONLINE' : 'OFFLINE'],
         'since': 'Since',
-        'port': 'Port',
-        'user': 'Remote user',
         'resources': (o, v) => v && [
             'Resources',
             '\n' + v.map((r, i) =>
@@ -274,21 +302,32 @@ const entityDescriptors = {
     },
     'job': {
         'id': 'Job number',
+        'continueJob': 'Continued job',
         'description': 'Title',
         'user': 'Owner',
         'groups': (o, v) => v && ['Groups', v.join(' ')],
         'error': (o, v) => v && ['Error', '"' + v + '"'],
         'provisioning': 'Provisioning',
-        'clusterRequest': 'Request',
-        'clusterReservation': 'Reservation',
+        'resources': 'Resources',
+        'utilComp': (o, v) => v && ['Util. GPU', Math.round(v * 100.0) + ' %'],
+        'utilMem':  (o, v) => v && ['Util. memory',  Math.round(v * 100.0) + ' %'],
         'state': (o, v) => ['State', jobStateNames[v] + (v == jobStates.WAITING ? ' (position ' + o.schedulePosition + ')' : '')],
+        'processes': (o, v) => v && [
+            'Processes', 
+            '\n' + v.map(p => '  [' + p.groupIndex + ', ' + p.processIndex + ']: Status code: ' + p.status + (p.result ? (' - ' + p.result) : '')).join('\n')
+        ],
         'stateChanges': (o, v) => v && [
             'State changes',
-            '\n' + Object.keys(v).map(state => '  ' + jobStateNames[state] + ': ' + v[state]).join('\n')
+            '\n' + v.map(sc => '  ' + jobStateNames[sc.state] + ': ' + sc.since + (sc.reason ? (' - ' + sc.reason) : '')).join('\n')
         ]
     },
     'alias': {
-        'name': 'Resource\'s name'
+        'id': 'Alias',
+        'name': 'For'
+    },
+    'group': {
+        'id': 'Name',
+        'title': 'Title'
     }
 }
 
@@ -356,14 +395,14 @@ function printUserPropertyHelp() {
 }
 
 function printNodePropertyHelp() {
-    printLine('Node properties: "address" (mandatory), "port", "cvd" (CUDA_VISIBLE_DEVICES), "user".')
+    printLine('Node properties: "address" (mandatory), "port", "minPort", "maxPort", "cvd" (CUDA_VISIBLE_DEVICES), "user".')
 }
 
 function printAliasPropertyHelp() {
     printLine('alias properties: "name".')
 }
 
-function printExample(line) {https://github.com/jamestalmage/cli-table2/blob/master/advanced-usage.md
+function printExample(line) {
     printLine(indent + '$ ' + line)
 }
 
@@ -377,7 +416,7 @@ function splitPair(value, separator, ...names) {
 }
 
 function parseEntity(entity, indexAllowed) {
-    pair = splitPair(entity, ':', 'type', 'id', 'index')
+    let pair = splitPair(entity, ':', 'type', 'id', 'index')
     pair.plural = (pair.type == 'alias') ? 'aliases' : (pair.type + 's')
     if (!indexAllowed && pair.hasOwnProperty('index')) {
         fail('Indices not allowed for ' + pair.type + ' entities')
@@ -416,36 +455,78 @@ function evaluateResponse(code, body) {
     }
 }
 
-function runCommand() {
-    var args = Array.prototype.slice.call(arguments)
-    var file = args.shift()
+function _runCommand(args, exitOnError) {
+    let file = args.shift()
+    let options = { encoding: 'utf8' }
+    if (!exitOnError) {
+        options.stdio = ['pipe', 'pipe', 'ignore']
+    }
     try {
-        return execFileSync(file, args, { encoding: 'utf8' }).trim()
+        return execFileSync(file, args, options).trim()
     } catch (err) {
+        if (!exitOnError) {
+            return
+        }
         var message = err.message.includes('ENOENT') ? 'Not found' : err.message
         fail('Problem executing "' + file + '": ' + message)
     }
 }
 
-function showPreparationLog(jobNumber) {
-    callPit('get', 'jobs/' + jobNumber + '/preplog', (code, res) => {
-        evaluateResponse(code)
-        res.on('data', chunk => {
-            process.stdout.write(chunk)
-        })
-    }, true)
+function tryCommand() {
+    return _runCommand(Array.prototype.slice.call(arguments), false)
 }
 
-function showLog(jobNumber, groupIndex, processIndex) {
-    groupIndex = groupIndex || 0
-    processIndex = processIndex || 0
-    let logPath = 'jobs/' + jobNumber + '/groups/' + groupIndex + '/processes/' + processIndex + '/log'
+function runCommand() {
+    return _runCommand(Array.prototype.slice.call(arguments), true)
+}
+
+function showLog(jobNumber) {
+    let logPath = 'jobs/' + jobNumber + '/log'
     callPit('get', logPath, (code, res) => {
         evaluateResponse(code)
         res.on('data', chunk => {
             process.stdout.write(chunk)
         })
-    }, true)
+    }, { asStream: true })
+}
+
+function printJobGroups(groups, asDate) {
+    let fixed = 6 + 3 + (asDate ? 24 : 12) + 3 + 3 + 10 + 20 + 7
+    let rest = process.stdout.columns
+    if (rest && rest >= fixed) {
+        rest = rest - fixed
+    } else {
+        rest = 30
+    }
+    writeFragment('JOB', 6, true, ' ')
+    writeFragment('S', 3, true, ' ')
+    writeFragment(asDate ? 'DATE' : 'SINCE', asDate ? 24 : 12, false, ' ')
+    writeFragment('UC%', 3, true, ' ')
+    writeFragment('UM%', 3, true, ' ')
+    writeFragment('USER', 10, false, ' ')
+    writeFragment('TITLE', 20, false, ' ')
+    writeFragment('RESOURCE', rest, false, '\n')
+
+    let printJobs = (jobs, caption) => {
+        if (jobs.length > 0) {
+            if (caption) {
+                console.log(caption + ':')
+            }
+            for(let job of jobs) {
+                writeFragment(job.id, 6, true, ' ')
+                writeFragment(jobStateNames[job.state], 3, true, ' ')
+                writeFragment(asDate ? job.date : formatDuration(job.since), asDate ? 24 : 12, false, ' ')
+                writeFragment(Math.round(job.utilComp * 100.0), 3, true, ' ')
+                writeFragment(Math.round(job.utilMem * 100.0), 3, true, ' ')
+                writeFragment(job.user, 10, false, ' ')
+                writeFragment(job.description, 20, false, ' ')
+                writeFragment(job.resources, rest, false, '\n')
+            }
+        }
+    }
+    for(let group of groups) {
+        printJobs(group.jobs, group.caption)
+    }
 }
 
 program
@@ -457,10 +538,11 @@ program
     .on('--help', function() {
         printIntro()
         printExample('pit add user:paul email=paul@x.y password=secret')
-        printExample('pit add node:machine1 address=192.168.2.2')
+        printExample('pit add node:machine1 endpoint=192.168.2.2 password=secret')
         printExample('pit add alias:gtx1070 name="GeForce GTX 1070"')
+        printExample('pit add group:students title="Students of machine learning department"')
         printLine()
-        printEntityHelp(entityUser, entityNode)
+        printEntityHelp(entityUser, entityNode, entityAlias, entityGroup)
         printPropertyHelp()
         printUserPropertyHelp()
         printNodePropertyHelp()
@@ -468,14 +550,16 @@ program
     })
     .action(function(entity, properties) {
         entity = parseEntity(entity)
-        if(entity.type == 'user' || entity.type == 'node' || entity.type == 'alias') {
+        if(entity.type == 'user' || entity.type == 'node' || entity.type == 'alias' || entity.type == 'group') {
             let obj = parseEntityProperties(entity, properties)
             if (entity.type == 'user') {
                 obj = promptUserInfo(obj)
             } else if (entity.type == 'node') {
                 obj = promptNodeInfo(obj)
-            } else {
+            } else if (entity.type == 'alias') {
                 obj = promptAliasInfo(obj)
+            } else {
+                obj = promptGroupInfo(obj)
             }
             callPit('put', entity.plural + '/' + entity.id, obj, evaluateResponse)
         } else {
@@ -489,16 +573,17 @@ program
     .description('removes an entity from the system')
     .on('--help', function() {
         printIntro()
-        printExample('pit remove user:paul')
+        printExample('pit remove user:anna')
         printExample('pit remove node:machine1')
         printExample('pit remove job:123')
         printExample('pit remove alias:gtx1070')
+        printExample('pit remove group:students')
         printLine()
-        printEntityHelp(entityUser, entityNode, entityJob, entityAlias)
+        printEntityHelp(entityUser, entityNode, entityJob, entityAlias, entityGroup)
     })
     .action(function(entity) {
         entity = parseEntity(entity)
-        if(entity.type == 'user' || entity.type == 'node' || entity.type == 'job' || entity.type == 'alias') {
+        if(entity.type == 'user' || entity.type == 'node' || entity.type == 'job' || entity.type == 'alias' || entity.type == 'group') {
             callPit('del', entity.plural + '/' + entity.id, evaluateResponse)
         } else {
             fail('Unsupported entity type "' + entity.type + '"')
@@ -511,11 +596,12 @@ program
     .on('--help', function() {
         printIntro()
         printExample('pit set user:paul email=x@y.z fullname="Paul Smith"')
-        printExample('pit set node:machine1 adremotedress=192.168.2.1')
+        printExample('pit set node:machine1 endpoint=192.168.2.1')
         printExample('pit set alias:gtx1070 name="GeForce GTX 1070"')
+        printExample('pit set group:students title="Different title"')
         printExample('pit set job:123 autoshare=students,professors')
         printLine()
-        printEntityHelp(entityUser, entityNode, entityJob, entityAlias)
+        printEntityHelp(entityUser, entityNode, entityAlias, entityGroup, entityJob)
         printPropertyHelp()
         printUserPropertyHelp()
         printNodePropertyHelp()
@@ -523,7 +609,7 @@ program
     })
     .action(function(entity, assignments) {
         entity = parseEntity(entity)
-        if(entity.type == 'user' || entity.type == 'node') {
+        if(entity.type == 'user' || entity.type == 'node' || entity.type == 'alias' || entity.type == 'group' || entity.type == 'job') {
             let obj = parseEntityProperties(entity, assignments)
             callPit('put', entity.plural + '/' + entity.id, obj, evaluateResponse)
         } else {
@@ -536,7 +622,7 @@ program
     .description('gets a property of an entity')
     .on('--help', function() {
         printIntro()
-        printExample('pit get user:paul email')
+        printExample('pit get user:anna email')
         printExample('pit get node:machine1 address')
         printExample('pit get alias:gtx1070 name')
         printExample('pit get job:123 autoshare')
@@ -564,7 +650,7 @@ program
     })
 
 program
-    .command('show <entity>')
+    .command('show <entity> [params...]')
     .description('shows info about an entity')
     .on('--help', function() {
         printIntro()
@@ -572,20 +658,47 @@ program
         printExample('pit show users')
         printExample('pit show groups')
         printExample('pit show nodes')
-        printExample('pit show jobs')
         printExample('pit show aliases')
+        printExample('pit show jobs')
+        printExample('pit show jobs user=jill')
+        printExample('pit show jobs since=4/2010 asc=date title="%test%"')
         printExample('pit show user:paul')
         printExample('pit show node:machine1')
         printExample('pit show job:235')
         printExample('pit show alias:gtx1070')
+        printExample('pit show group:students')
         printLine()
-        printEntityHelp('me', 'users', 'groups', 'nodes', 'jobs', 'aliases', entityUser, entityNode, entityJob, entityAlias)
+        printEntityHelp('me', 'users', 'groups', 'nodes', 'jobs', 'aliases', entityUser, entityNode, entityJob, entityAlias, entityGroup)
+        printLine()
+        printLine('For "show jobs" the following query parameters (combined by AND) are supported:')
+        printLine('  since=<date value> - shows jobs with a state change date past the provided date')
+        printLine('  till=<date value>  - shows jobs with a state change date before the provided date')
+        printLine('  user=<username>    - shows jobs owned by the provided user')
+        printLine('  title=<wildcard>   - shows jobs whose titles match the provided wildcard')
+        printLine('  asc=<field>        - orders jobs ascending by provided field (date|user|title|state)')
+        printLine('  desc=<field>       - orders jobs descending by provided field (date|user|title|state)')
+        printLine('  limit=<number>     - shows first N results')
+        printLine('  offset=<number>    - shows jobs beginning with N-th result')
     })
-    .action(function(entity, options) {
-        if(entity === 'users' || entity === 'groups' || entity === 'nodes' || entity === 'jobs' || entity === 'aliases') {
+    .action(function(entity, params, options) {
+        if(entity === 'users' || entity === 'groups' || entity === 'nodes' || entity === 'aliases') {
             callPit('get', entity, function(code, body) {
                 if (code == 200) {
                     body.forEach(obj => console.log(obj))
+                } else {
+                    evaluateResponse(code, body)
+                }
+            })
+        } else if(entity === 'jobs') {
+            let obj = parseEntityProperties(entity, params)
+            let query = []
+            for(let param of Object.keys(obj)) {
+                query.push(encodeURI(param) + '=' + encodeURI(obj[param]))
+            }
+            query = query.length > 0 ? '?' + query.join('&') : ''
+            callPit('get', entity + query, function(code, body) {
+                if (code == 200) {
+                    printJobGroups([{ jobs: body }], true)
                 } else {
                     evaluateResponse(code, body)
                 }
@@ -638,7 +751,7 @@ program
         printIntro()
         printExample('pit add-group node:machine1 professors')
         printExample('pit add-group node:machine1:0 students')
-        printExample('pit add-group user:paul students')
+        printExample('pit add-group user:anna students')
         printExample('pit add-group job:123 students')
         printLine()
         printEntityHelp(entityUser, entityNode, entityJob, 'node:<node name>:<resource index>')
@@ -694,29 +807,33 @@ program
     .description('enqueues current directory as new job')
     .option('-p, --private', 'prevents automatic sharing of this job')
     .option('-c, --continue <jobNumber>', 'continues job with provided number by copying its "keep" directory over to the new job')
-    .option('-w, --watch', 'immediately starts watching the job log output on secondary buffer')
+    .option('-d, --direct <commands>', 'directly executes provided commands through bash instead of loading .compute file')
     .option('-l, --log', 'waits for and prints job\'s log output')
     .on('--help', function() {
         printIntro()
-        printExample('pit put 2:[8:gtx1070]')
+        printExample('pit run "My task" 2:[8:gtx1070]')
+        printExample('pit run "My command" [] -d \'hostname; env\'')
         printLine()
         printLine('"title" is a short text that will later help identifying the job and its purpose.')
         printLine('"clusterRequest" is an expression to specify resources this job requires from the cluster.')
         printLine('It\'s a comma separated list of "process requests".')
         printLine('Each "process request" specifies the number of process instances and (divided by colon and in braces) which resources to allocate for one process instances (on one node).')
-        printLine('The example above will allocate 2 process instances. For each process, 8 "gtx1070" resources will get allocated.')
+        printLine('The first example will allocate 2 process instances. For each process, 8 "gtx1070" resources will get allocated.')
         printLine('You can also provide a "' + REQUEST_FILE + '" file with the same content in your project root as default value.')
     })
     .action(function(title, clusterRequest, options) {
-        var tracking = runCommand('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}')
+        var tracking = tryCommand('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}') || 'origin/master'
         var ob = tracking.split('/')
         if (ob.length != 2) {
             fail('Problem getting tracked git remote and branch')
         }
         var origin = ob[0]
         var branch = ob[1]
-        var hash = runCommand('git', 'rev-parse', tracking)
-        var originUrl = runCommand('git', 'remote', 'get-url', origin)
+        var hash = tryCommand('git', 'rev-parse', tracking)
+        if (!hash) {
+            fail('Problem getting remote branch "' + tracking + '"')
+        }
+        var originUrl = runCommand('git', 'remote', 'get-url', '--push', origin)
         if (originUrl.startsWith(githubGitPrefix)) {
             originUrl = githubHttpsPrefix + originUrl.substr(githubGitPrefix.length)
         }
@@ -737,23 +854,18 @@ program
             clusterRequest: clusterRequest,
             description: title,
             private: options.private,
-            continueJob: options.continue
+            continueJob: options.continue,
+            script: options.direct
         }, (code, body) => {
             if (code == 200) {
                 console.log('Job number: ' + body.id)
-                console.log('Remote:     ' + origin + ' <' + originUrl + '>')
+                console.log('Remote:     ' + origin + ' <' + originUrl.replace(/\/\/.*\@/g, '//') + '>')
                 console.log('Hash:       ' + hash)
                 console.log('Diff LoC:   ' + diff.split('\n').length)
                 console.log('Resources:  "' + clusterRequest + '"')
-                if (options.watch) {
-                    enterSecondary()
-                    clearScreen()
-                    showPreparationLog(body.id)
-                    showLog(body.id, 0, 0)
-                } else if (options.log) {
+                if (options.log) {
                     console.log()
-                    showPreparationLog(body.id)
-                    showLog(body.id, 0, 0)
+                    showLog(body.id)
                 }
             } else {
                 evaluateResponse(code, body)
@@ -762,29 +874,16 @@ program
     })
 
 program
-    .command('log <jobNumber> [groupIndex] [processIndex]')
-    .description('continuously watches job\'s log output')
-    .option('-w, --watch', 'continuous watching')
+    .command('log <jobNumber>')
+    .description('show job\'s log')
+    .option('-f, --follow', 'continuously shows further log output if the job is still running')
     .on('--help', function() {
         printIntro()
-        printExample('pit log p')
-        printExample('pit log 1234')
-        printExample('pit log 1234 0 1')
+        printExample('pit log -f')
         printLine()
-        printLine('"jobNumber" is the number of the job who\'s log should be shown.')
-        printLine('"groupIndex" is the index number of a specific process group. if set to "p", the preparation log is shown and "processIndex" ignored.')
-        printLine('"processIndex" is the index number of a process within the specified process group.')
     })
-    .action((jobNumber, groupIndex, processIndex, options) => {
-        if (options.watch) {
-            enterSecondary()
-            clearScreen()
-        }
-        if (groupIndex == 'p') {
-            showPreparationLog(jobNumber)
-        } else {
-            showLog(jobNumber, groupIndex, processIndex)
-        }
+    .action((jobNumber, options) => {
+        showLog(jobNumber)
     })
 
 program
@@ -802,82 +901,210 @@ program
         callPit('get', 'jobs/' + jobNumber + '/targz', (code, res) => {
             evaluateResponse(code)
             res.pipe(fs.createWriteStream(filename))
-        }, true)
+        }, { asStream: true })
+    })
+
+program
+    .command('ls <jobNumber> [path]')
+    .description('lists contents within a job directory')
+    .on('--help', function() {
+        printIntro()
+        printExample('pit mount 1234 ./job1234')
+        printLine()
+        printLine('"jobNumber" is the number of the job who\'s job directory should be accessed.')
+        printLine('"path" is the path to list within the job directory.')
+    })
+    .action((jobNumber, path) => {
+        let job = 'jobs/' + jobNumber + '/'
+        let resource = path ? (path.startsWith('/') ? path.slice(1) : path) : ''
+        callPit('get', job + 'stats/' + resource, (code, stats) => {
+            evaluateResponse(code)
+            if (stats.isFile) {
+                console.log('F ' + resource)
+            } else {
+                callPit('get', job + 'content/' + resource, (code, contents) => {
+                    evaluateResponse(code)
+                    for(let dir of contents.dirs) {
+                        console.log('D ' + dir)
+                    }
+                    for(let file of contents.files) {
+                        console.log('F ' + file)
+                    }
+                })
+            }
+        })
+    })
+
+program
+    .command('cp <jobNumber> <jobPath> <fsPath>')
+    .description('copies contents within from job directory to local file system')
+    .on('--help', function() {
+        printIntro()
+        printExample('pit cp 1234 keep/checkpoint-0001.bin ./checkpoint.bin')
+        printLine()
+        printLine('"jobNumber" is the number of the job who\'s job directory should be accessed.')
+        printLine('"jobPath" is the source path within the job directory.')
+        printLine('"fsPath" is the destination path within local filesystem.')
+    })
+    .action((jobNumber, jobPath, fsPath) => {
+        let job = 'jobs/' + jobNumber + '/'
+        let resource = jobPath ? (jobPath.startsWith('/') ? jobPath.slice(1) : jobPath) : ''
+        callPit('get', job + 'stats/' + resource, (code, stats) => {
+            evaluateResponse(code)
+            if (stats.isFile) {
+                let offset = 0
+                if (fs.existsSync(fsPath)) {
+                    let localStats = fs.statSync(fsPath)
+                    if (localStats.isDirectory()) {
+                        let rname = jobPath.substring(jobPath.lastIndexOf('/') + 1)
+                        if (rname.length > 0) {
+                            fsPath = path.join(fsPath, rname)
+                        } else {
+                            fail('Cannot construct target filename.')
+                        }
+                    } else if (localStats.isFile()) {
+                        offset = localStats.size
+                    } else {
+                        fail('Cannot write to target.')
+                    }
+                } else {
+                    let dirname = path.dirname(fsPath)
+                    if (fs.existsSync(dirname)) {
+                        if (!fs.statSync(dirname).isDirectory()) {
+                            fail('Target directory not a directory.')
+                        }
+                    } else {
+                        fail('Target directory not existing.')
+                    }
+                }
+                callPit('get', job + 'content/' + resource, (code, res) => {
+                    evaluateResponse(code)
+                    res.pipe(fs.createWriteStream(fsPath))
+                }, { asStream: true }) // offset: offset
+            } else {
+                fail('At the moment only file copying is supported.')
+            }
+        })
+    })
+
+program
+    .command('mount <entity> [mountpoint]')
+    .description('mounts the data directory of an entity to a local mountpoint')
+    .option('--shell', 'starts a shell in the mounted directory. The mount will be automatically unmounted upon shell exit.')
+    .on('--help', function() {
+        printIntro()
+        printExample('pit mount home')
+        printExample('pit mount user:anna ~/annahome')
+        printExample('pit mount --shell job:1234')
+        printExample('pit mount group:students ./students')
+        printExample('pit mount shared ./shared')
+        printLine()
+        printLine('"entity" is the entity whose data directory will be mounted')
+        printEntityHelp('home', entityUser, entityJob, entityGroup, 'shared')
+        printLine('"mountpoint" is the directory where the data directory will be mounted onto. Has to be empty. If omitted, a temporary directory will be used as mountpoint and automatically deleted on unmounting.')
+        printLine('Home and group directories are write-enabled, all others are read-only.')
+    })
+    .action((entity, mountpoint, options) => {
+        let httpfs
+        try {
+            httpfs = require('./httpfs.js')
+        } catch (ex) {
+            fail(
+                'For mounting, package "fuse" has to be installed.\n' +
+                'Most likely it has been skipped due to missing dependencies.\n' +
+                'Please consult the following page for system specific requirements:\n' +
+                '\thttps://github.com/mafintosh/fuse-bindings#requirements\n' +
+                'Once fulfilled, you can either re-install snakepit-client or\n' +
+                'call again "npm install" within its project root.'
+            )
+        }
+        let endpoint
+        entity = parseEntity(entity)
+        if (entity.type == 'home') {
+            endpoint = '/users/~/fs' 
+        } else if (entity.type == 'group' || entity.type == 'user' || entity.type == 'job') {
+            endpoint = '/' + entity.plural + '/' + entity.id + '/fs'
+        } else if (entity.type == 'shared') {
+            endpoint = '/shared'
+        } else {
+            fail('Unsupported entity type "' + entity.type + '"')
+        }
+        getConnectionSettings(connection => {
+            if (mountpoint) {
+                mountpoint = { name: mountpoint, removeCallback: () => {} }
+            } else {
+                mountpoint = tmp.dirSync()
+            }
+            let mountOptions = { 
+                headers: { 'X-Auth-Token': connection.token },
+                cache: true,
+                blocksize: 10 * 1024 * 1024
+            }
+            if (connection.ca) {
+                mountOptions.certificate = connection.ca
+            }
+            httpfs.mount(
+                connection.url + endpoint,
+                mountpoint.name, 
+                mountOptions, 
+                (err, mount) => {
+                    if (err) { 
+                        fail(err) 
+                    }
+                    let unmount = () => mount.unmount(err => {
+                        if (err) {
+                            console.error('problem unmounting filesystem:', err)
+                        } else {
+                            mountpoint.removeCallback()
+                        }
+                    })
+                    if (options.shell) {
+                        console.log('secondary shell: call "exit" to end and unmount')
+                        let sh = spawn(process.env.SHELL || 'bash', ['-i'], { stdio: 'inherit', cwd: mountpoint.name })
+                        sh.on('close', unmount)
+                    } else {
+                        console.log('press Ctrl-C to unmount')
+                        globalunmount = unmount
+                    }
+                }
+            )
+        })
     })
 
 program
     .command('status')
     .description('prints a job status report')
-    .option('-w, --watch', 'continuous watching')
     .on('--help', function() {
         printIntro()
         printExample('pit status')
     })
     .action(function(options) {
         let updateStatus = () => {
-            if (options.watch) {
-                enterSecondary()
-            }
-            callPit('get', 'status', function(code, jobGroups) {
+            callPit('get', 'jobs/status', function(code, jobGroups) {
                 if (code == 200) {
-                    if (options.watch) {
-                        clearScreen()
-                    }
-                    let fixed = 6 + 3 + 12 + 3 + 3 + 10 + 20 + 7
-                    let rest = process.stdout.columns
-                    if (rest && rest >= fixed) {
-                        rest = rest - fixed
-                    } else {
-                        rest = 30
-                    }
-                    writeFragment('JOB', 6, true, ' ')
-                    writeFragment('S', 3, true, ' ')
-                    writeFragment('SINCE', 12, false, ' ')
-                    writeFragment('UC%', 3, true, ' ')
-                    writeFragment('UM%', 3, true, ' ')
-                    writeFragment('USER', 10, false, ' ')
-                    writeFragment('TITLE', 20, false, ' ')
-                    writeFragment('RESOURCE', rest, false, '\n')
-
-                    let printJobs = (jobs, caption) => {
-                        if (jobs.length > 0) {
-                            if (caption) {
-                                console.log(caption + ':')
-                            }
-                            for(let job of jobs) {
-                                writeFragment(job.id, 6, true, ' ')
-                                writeFragment(jobStateNames[job.state], 3, true, ' ')
-                                writeFragment(formatDuration(job.since), 12, false, ' ')
-                                writeFragment(Math.round(job.utilComp), 3, true, ' ')
-                                writeFragment(Math.round(job.utilMem), 3, true, ' ')
-                                writeFragment(job.user, 10, false, ' ')
-                                writeFragment(job.description, 20, false, ' ')
-                                writeFragment(job.clusterReservation || job.clusterRequest, rest, false, '\n')
-                            }
-                        }
-                    }
-                    printJobs(jobGroups.running, 'Running')
-                    printJobs(jobGroups.waiting, 'Waiting')
-                    printJobs(jobGroups.done, 'Done')
+                    printJobGroups([
+                        { jobs: jobGroups.running, caption: 'Running' },
+                        { jobs: jobGroups.waiting, caption: 'Waiting' },
+                        { jobs: jobGroups.done,    caption: 'Done'    }
+                    ])
                 } else {
                     evaluateResponse(code, jobGroups)
-                }
-                if (options.watch) {
-                    setTimeout(updateStatus, 1000)
                 }
             })
         }
         updateStatus()
     })
 
+program
+    .command('*')
+    .action(function() {
+        fail("unknown command");
+    })
+
 program.parse(process.argv)
 
 if (!process.argv.slice(2).length) {
     program.outputHelp();
-}
-
-function escape(seq) {
-    process.stdout.write('\033' + seq)
 }
 
 function writeFragment(text, len, right, padding) {
@@ -889,37 +1116,20 @@ function writeFragment(text, len, right, padding) {
     process.stdout.write(text + padding)
 }
 
-var inSecondary = false
-
-function enterSecondary() {
-    if (!inSecondary) {
-        inSecondary = true
-        escape('[s')
-        escape('[?47h')
-        escape('[?25l')
+function unmount() {
+    if (globalunmount) {
+        console.log('\runmounting...')
+        globalunmount()
+        globalunmount = null
     }
-}
-
-function exitSecondary() {
-    if (inSecondary) {
-        escape('[?25h')
-        escape('[?47l')
-        escape('[u')
-        inSecondary = false
-    }
-}
-
-function clearScreen() {
-    escape('[2J')
-    escape('[0;0H')
 }
 
 process.on('SIGINT', () => {
-    exitSecondary()
+    unmount()
     process.exit(0)
 })
 
 process.on('exit', () => {
-    exitSecondary()
+    unmount()
 })
 
